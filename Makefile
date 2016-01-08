@@ -1,18 +1,29 @@
+CC      := gcc
+CFLAGS  := -I../include -D_GNU_SOURCE -D_REENTRANT
 LD      := gcc
-LDFLAGS := ${LDFLAGS} -D_REENTRANT -lpthread -libverbs
-
-APPS    := ud_pingpong
+LDFLAGS := ${LDFLAGS} -lpthread -L../src/.libs -libverbs
+#../src/.libs/libibverbs.so
+#../src/.libs/libibverbs.a
+APPS    := ud devinfo ud_pingpong
 
 all: ${APPS}
+
+ud: ud.o pingpong.o
+	${LD} -o $@ $^ ${LDFLAGS}
+
+ud.o: ud.c pingpong.h
+	${CC} ${CFLAGS} -c $<
+
+pingpong.o: pingpong.c pingpong.h
+	${CC} ${CFLAGS} -c $<
+
+
+
+devinfo: devinfo.o pingpong.o
+	${LD} -o $@ $^ ${LDFLAGS}
 
 ud_pingpong: ud_pingpong.o pingpong.o
 	${LD} -o $@ $^ ${LDFLAGS}
 
-ud_pingpong.o: ud_pingpong.c pingpong.h
-	${LD} -c $< ${LDFLAGS}
-
-pingpong.o: pingpong.c pingpong.h
-	${LD} -c $< ${LDFLAGS}
-
 clean:
-	rm -rf ud_pingpng *.o
+	rm -rf ${APPS} ud.o
