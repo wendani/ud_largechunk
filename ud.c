@@ -46,8 +46,11 @@
 #include <getopt.h>
 #include <arpa/inet.h>
 #include <time.h>
+#include <stdint.h>
 
 #include "pingpong.h"
+
+#define GRH_SIZE    40
 
 enum {
 	PINGPONG_RECV_WRID = 1,
@@ -64,12 +67,16 @@ struct pingpong_context {
 	struct ibv_cq		*cq;
 	struct ibv_qp		*qp;
 	struct ibv_ah		*ah;
+	void            *grh_buf;
 	void			*buf;
-	int			 size;
+	unsigned long long			 size;
 	int			 send_flags;
 	int			 rx_depth;
 	int			 pending;
 	struct ibv_port_attr     portinfo;
+	int          mtu;
+	struct ibv_mr       *mr_grh;
+	void            *buf_curr;
 };
 
 struct pingpong_dest {
@@ -78,6 +85,49 @@ struct pingpong_dest {
 	int psn;
 	union ibv_gid gid;
 };
+
+
+static void pp_dump_grh(struct ibv_grh *grh)
+{
+    char sgid[40] = {0};
+    char dgid[40] = {0};
+    uint32_t vtf = ntohl(grh->version_tclass_flow);
+    inet_ntop(AF_INET6, &grh->sgid, sgid, sizeof(sgid));
+    inet_ntop(AF_INET6, &grh->dgid, dgid, sizeof(dgid));
+    printf("GRH: IPVer 0x%01x  TClass 0x%02x  FlowLabel 0x%05x  PayLen %u  NxtHdr 0x%02x  HopLmt 0x%02x  SGID %016lx:%016lx  SGID %s  DGID %016lx:%016lx  DGID %s\n",
+            vtf >> 28, (vtf & 0xFF00000) >> 20, vtf & 0xFFFFF, ntohs(grh->paylen), grh->next_hdr, grh->hop_limit,
+            grh->sgid.global.subnet_prefix, grh->sgid.global.interface_id, sgid, grh->dgid.global.subnet_prefix, grh->dgid.global.interface_id, dgid);
+}
+
+static inline void pp_sdump_data(void *buf, int size)
+{
+    printf("%.*s\n", size, (char *)buf);
+}
+
+
+static void pp_pop_data(void *buf, unsigned long long size, int mtu)
+{
+    int val = 65;
+
+    if (size > mtu) {
+        int i = 0;
+        int cnt = size / mtu;
+
+        for (i = 0; i < cnt; ++i) {
+            memset(buf, val, mtu);
+
+            buf = buf + mtu;
+            val++;
+            if (val == 91)
+                val = 65;
+        }
+        if ((cnt = size % mtu))
+            memset(buf, val, cnt);
+    }
+    else
+        memset(buf, val, size);
+}
+
 
 static int pp_connect_ctx(struct pingpong_context *ctx, int port, int my_psn,
 			  int sl, struct pingpong_dest *dest, int sgid_idx)
@@ -296,7 +346,7 @@ out:
 	return rem_dest;
 }
 
-static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
+static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, unsigned long long size,
 					    int rx_depth, int port,
 					    int use_event)
 {
@@ -310,14 +360,22 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
 	ctx->send_flags = IBV_SEND_SIGNALED;
 	ctx->rx_depth   = rx_depth;
 
-	ctx->buf = memalign(page_size, size + 40);
+	ctx->grh_buf = memalign(page_size, GRH_SIZE);
+    if (!ctx->grh_buf) {
+        fprintf(stderr, "Couldn't allocate grh buf.\n");
+        goto clean_ctx;
+    }
+	ctx->buf = memalign(page_size, size);
 	if (!ctx->buf) {
 		fprintf(stderr, "Couldn't allocate work buf.\n");
-		goto clean_ctx;
+		goto clean_grh_buffer;
 	}
 
 	/* FIXME memset(ctx->buf, 0, size + 40); */
-	memset(ctx->buf, 0x7b, size + 40);
+//	memset(ctx->buf, 0x7b, size + 40);
+	memset(ctx->grh_buf, 0, GRH_SIZE);
+	memset(ctx->buf, 0, size);
+	ctx->buf_curr = ctx->buf;
 
 	ctx->context = ibv_open_device(ib_dev);
 	if (!ctx->context) {
@@ -335,10 +393,11 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
 			goto clean_device;
 		}
 		mtu = 1 << (port_info.active_mtu + 7);
-		if (size > mtu) {
-			fprintf(stderr, "Requested size larger than port MTU (%d)\n", mtu);
-			goto clean_device;
-		}
+//		if (size > mtu) {
+//			fprintf(stderr, "Requested size larger than port MTU (%d)\n", mtu);
+//			goto clean_device;
+//		}
+		ctx->mtu = mtu;
 	}
 
 	if (use_event) {
@@ -356,10 +415,15 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
 		goto clean_comp_channel;
 	}
 
-	ctx->mr = ibv_reg_mr(ctx->pd, ctx->buf, size + 40, IBV_ACCESS_LOCAL_WRITE);
+	ctx->mr_grh = ibv_reg_mr(ctx->pd, ctx->grh_buf, GRH_SIZE, IBV_ACCESS_LOCAL_WRITE);
+    if (!ctx->mr_grh) {
+        fprintf(stderr, "Couldn't register MR for GRH\n");
+        goto clean_pd;
+    }
+	ctx->mr = ibv_reg_mr(ctx->pd, ctx->buf, size, IBV_ACCESS_LOCAL_WRITE);
 	if (!ctx->mr) {
 		fprintf(stderr, "Couldn't register MR\n");
-		goto clean_pd;
+		goto clean_mr_grh;
 	}
 
 	ctx->cq = ibv_create_cq(ctx->context, rx_depth + 1, NULL,
@@ -378,7 +442,7 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
 				.max_send_wr  = 1,
 				.max_recv_wr  = rx_depth,
 				.max_send_sge = 1,
-				.max_recv_sge = 1
+				.max_recv_sge = 2
 			},
 			.qp_type = IBV_QPT_UD,
 		};
@@ -424,6 +488,9 @@ clean_cq:
 clean_mr:
 	ibv_dereg_mr(ctx->mr);
 
+clean_mr_grh:
+    ibv_dereg_mr(ctx->mr_grh);
+
 clean_pd:
 	ibv_dealloc_pd(ctx->pd);
 
@@ -436,6 +503,9 @@ clean_device:
 
 clean_buffer:
 	free(ctx->buf);
+
+clean_grh_buffer:
+    free(ctx->grh_buf);
 
 clean_ctx:
 	free(ctx);
@@ -454,6 +524,11 @@ int pp_close_ctx(struct pingpong_context *ctx)
 		fprintf(stderr, "Couldn't destroy CQ\n");
 		return 1;
 	}
+
+    if (ibv_dereg_mr(ctx->mr_grh)) {
+        fprintf(stderr, "Couldn't deregister MR for GRH\n");
+        return 1;
+    }
 
 	if (ibv_dereg_mr(ctx->mr)) {
 		fprintf(stderr, "Couldn't deregister MR\n");
@@ -488,33 +563,67 @@ int pp_close_ctx(struct pingpong_context *ctx)
 	return 0;
 }
 
-static int pp_post_recv(struct pingpong_context *ctx, int n)
+static int pp_post_recv(struct pingpong_context *ctx, int data_size)
 {
-	struct ibv_sge list = {
-		.addr	= (uintptr_t) ctx->buf,
-		.length = ctx->size + 40,
-		.lkey	= ctx->mr->lkey
+//    if (data_size < 0) {
+//        fprintf(stderr, "post recv data size < 0\n");
+//        return 1;
+//    }
+//
+//    if (data_size > ctx->mtu) {
+//        fprintf(stderr, "post recv data size larger than port MTU (%d)\n", ctx->mtu);
+//        return 1;
+//    }
+
+	struct ibv_sge list[2] = {
+	        {
+	                .addr   = (uintptr_t) ctx->grh_buf,
+	                .length = GRH_SIZE,
+	                .lkey   = ctx->mr_grh->lkey
+	        },
+	        {
+	                .addr	= (uintptr_t) ctx->buf_curr,
+	                .length = data_size,
+	                .lkey	= ctx->mr->lkey
+	        }
 	};
 	struct ibv_recv_wr wr = {
 		.wr_id	    = PINGPONG_RECV_WRID,
-		.sg_list    = &list,
-		.num_sge    = 1,
+		.sg_list    = list,
+		.num_sge    = 2,
 	};
 	struct ibv_recv_wr *bad_wr;
-	int i;
+//	int i;
 
-	for (i = 0; i < n; ++i)
-		if (ibv_post_recv(ctx->qp, &wr, &bad_wr))
-			break;
+//	for (i = 0; i < n; ++i)
+//		if (ibv_post_recv(ctx->qp, &wr, &bad_wr))
+//			break;
 
-	return i;
+//	return i;
+
+	int ret;
+	if ((ret = ibv_post_recv(ctx->qp, &wr, &bad_wr)))
+	    return ret;
+
+	ctx->buf_curr += data_size;
+	return 0;
 }
 
-static int pp_post_send(struct pingpong_context *ctx, uint32_t qpn)
+static int pp_post_send(struct pingpong_context *ctx, uint32_t qpn, int data_size)
 {
+//    if (data_size < 0) {
+//        fprintf(stderr, "post send data size < 0\n");
+//        return 1;
+//    }
+//
+//    if (data_size > ctx->mtu) {
+//        fprintf(stderr, "post send data size larger than port MTU (%d)\n", ctx->mtu);
+//        return 1;
+//    }
+
 	struct ibv_sge list = {
-		.addr	= (uintptr_t) ctx->buf + 40,
-		.length = ctx->size,
+		.addr	= (uintptr_t) ctx->buf_curr,
+		.length = data_size,
 		.lkey	= ctx->mr->lkey
 	};
 	struct ibv_send_wr wr = {
@@ -532,8 +641,13 @@ static int pp_post_send(struct pingpong_context *ctx, uint32_t qpn)
 		}
 	};
 	struct ibv_send_wr *bad_wr;
+	int ret;
 
-	return ibv_post_send(ctx->qp, &wr, &bad_wr);
+	if ((ret = ibv_post_send(ctx->qp, &wr, &bad_wr)))
+	    return ret;
+
+	ctx->buf_curr += data_size;
+	return 0;
 }
 
 static void usage(const char *argv0)
@@ -546,9 +660,9 @@ static void usage(const char *argv0)
 	printf("  -p, --port=<port>      listen on/connect to port <port> (default 18515)\n");
 	printf("  -d, --ib-dev=<dev>     use IB device <dev> (default first device found)\n");
 	printf("  -i, --ib-port=<port>   use port <port> of IB device (default 1)\n");
-	printf("  -s, --size=<size>      size of message to exchange (default 1024)\n");
+	printf("  -s, --size=<size>      size of message to exchange (default 2048)\n");
 	printf("  -r, --rx-depth=<dep>   number of receives to post at a time (default 500)\n");
-	printf("  -n, --iters=<iters>    number of exchanges (default 1000)\n");
+	printf("  -n, --iters=<iters>    number of exchanges (default 1)\n");
 	printf("  -e, --events           sleep on CQ events (default poll)\n");
 	printf("  -g, --gid-idx=<gid index> local port gid index\n");
 }
@@ -565,9 +679,9 @@ int main(int argc, char *argv[])
 	char                    *servername = NULL;
 	unsigned int             port = 18515;
 	int                      ib_port = 1;
-	unsigned int             size = 1024;
+	unsigned long long      size = 2048;
 	unsigned int             rx_depth = 500;
-	unsigned int             iters = 1000;
+	unsigned int             iters = 1;
 	int                      use_event = 0;
 	int                      routs;
 	int                      rcnt, scnt;
@@ -575,6 +689,8 @@ int main(int argc, char *argv[])
 	int                      sl = 0;
 	int			 gidx = -1;
 	char			 gid[33];
+	unsigned int            cnt;
+	int                     rmnder;
 
 	srand48(getpid() * time(NULL));
 
@@ -687,10 +803,39 @@ int main(int argc, char *argv[])
 	if (!ctx)
 		return 1;
 
-	routs = pp_post_recv(ctx, ctx->rx_depth);
-	if (routs < ctx->rx_depth) {
-		fprintf(stderr, "Couldn't post receive (%d)\n", routs);
-		return 1;
+
+	iters = size / ctx->mtu;
+	if ((rmnder = size % ctx->mtu))
+	    ++iters;
+
+	if (!servername) {
+	    routs = 0;
+	    while (routs < ctx->rx_depth) {
+	        ++routs;
+
+	        if (routs < iters) {
+	            if (pp_post_recv(ctx, ctx->mtu)) {
+	                fprintf(stderr, "Couldn't post receive (%d)\n", routs);
+	                return 1;
+	            }
+	        }
+	        else {
+	            // routs == iters
+	            if (rmnder) {
+	                if (pp_post_recv(ctx, rmnder)) {
+	                    fprintf(stderr, "Couldn't post receive (%d)\n", routs);
+	                    return 1;
+	                }
+	            }
+	            else {
+	                if (pp_post_recv(ctx, ctx->mtu)) {
+	                    fprintf(stderr, "Couldn't post receive (%d)\n", routs);
+	                    return 1;
+	                }
+	            }
+	            break;
+	        }
+	    }
 	}
 
 	if (use_event)
@@ -717,7 +862,7 @@ int main(int argc, char *argv[])
 	} else
 		memset(&my_dest.gid, 0, sizeof my_dest.gid);
 
-	printf("GID %16lx:%16lx\n", my_dest.gid.global.subnet_prefix,my_dest.gid.global.interface_id);
+	printf("GID %016lx:%016lx\n", my_dest.gid.global.subnet_prefix, my_dest.gid.global.interface_id);
 	inet_ntop(AF_INET6, &my_dest.gid, gid, sizeof gid);
 	printf("  local address:  LID 0x%04x, QPN 0x%06x, PSN 0x%06x: GID %s\n",
 	       my_dest.lid, my_dest.qpn, my_dest.psn, gid);
@@ -735,19 +880,37 @@ int main(int argc, char *argv[])
 	printf("  remote address: LID 0x%04x, QPN 0x%06x, PSN 0x%06x, GID %s\n",
 	       rem_dest->lid, rem_dest->qpn, rem_dest->psn, gid);
 
-	if (servername)
+	if (servername) {
 		if (pp_connect_ctx(ctx, ib_port, my_dest.psn, sl, rem_dest,
 									gidx))
 			return 1;
 
-	ctx->pending = PINGPONG_RECV_WRID;
+		// populate data payload
+		pp_pop_data(ctx->buf, size, ctx->mtu);
+	}
 
 	if (servername) {
-		if (pp_post_send(ctx, rem_dest->qpn)) {
-			fprintf(stderr, "Couldn't post send\n");
-			return 1;
-		}
-		ctx->pending |= PINGPONG_SEND_WRID;
+	    if (iters > 1) {
+	        if (pp_post_send(ctx, rem_dest->qpn, ctx->mtu)) {
+	            fprintf(stderr, "Couldn't post send\n");
+	            return 1;
+	        }
+	    }
+	    else {
+	        // iters == 1
+	        if (rmnder) {
+	            if (pp_post_send(ctx, rem_dest->qpn, rmnder)) {
+	                fprintf(stderr, "Couldn't post send\n");
+	                return 1;
+	            }
+	        }
+	        else {
+	            if (pp_post_send(ctx, rem_dest->qpn, ctx->mtu)) {
+	                fprintf(stderr, "Couldn't post send\n");
+	                return 1;
+	            }
+	        }
+	    }
 	}
 
 	if (gettimeofday(&start, NULL)) {
@@ -755,87 +918,125 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	rcnt = scnt = 0;
-	while (rcnt < iters || scnt < iters) {
-		if (use_event) {
-			struct ibv_cq *ev_cq;
-			void          *ev_ctx;
+	// completion events processing
+	cnt = 0;
+	while (cnt < iters) {
+	    if (use_event) {
+	        struct ibv_cq *ev_cq;
+	        void          *ev_ctx;
 
-			if (ibv_get_cq_event(ctx->channel, &ev_cq, &ev_ctx)) {
-				fprintf(stderr, "Failed to get cq_event\n");
-				return 1;
-			}
+	        if (ibv_get_cq_event(ctx->channel, &ev_cq, &ev_ctx)) {
+	            fprintf(stderr, "Failed to get cq_event\n");
+	            return 1;
+	        }
 
-			++num_cq_events;
+	        ++num_cq_events;
 
-			if (ev_cq != ctx->cq) {
-				fprintf(stderr, "CQ event for unknown CQ %p\n", ev_cq);
-				return 1;
-			}
+	        if (ev_cq != ctx->cq) {
+	            fprintf(stderr, "CQ event for unknown CQ %p\n", ev_cq);
+	            return 1;
+	        }
 
-			if (ibv_req_notify_cq(ctx->cq, 0)) {
-				fprintf(stderr, "Couldn't request CQ notification\n");
-				return 1;
-			}
-		}
+	        if (ibv_req_notify_cq(ctx->cq, 0)) {
+	            fprintf(stderr, "Couldn't request CQ notification\n");
+	            return 1;
+	        }
+	    }
 
-		{
-			struct ibv_wc wc[2];
-			int ne, i;
+	    {
+	        struct ibv_wc wc[2];
+	        int ne, i;
 
-			do {
-				ne = ibv_poll_cq(ctx->cq, 2, wc);
-				if (ne < 0) {
-					fprintf(stderr, "poll CQ failed %d\n", ne);
-					return 1;
-				}
-			} while (!use_event && ne < 1);
+	        do {
+	            ne = ibv_poll_cq(ctx->cq, 2, wc);
+	            if (ne < 0) {
+	                fprintf(stderr, "poll CQ failed %d\n", ne);
+	                return 1;
+	            }
+	        } while (!use_event && ne < 1);
 
-			for (i = 0; i < ne; ++i) {
-				if (wc[i].status != IBV_WC_SUCCESS) {
-					fprintf(stderr, "Failed status %s (%d) for wr_id %d\n",
-						ibv_wc_status_str(wc[i].status),
-						wc[i].status, (int) wc[i].wr_id);
-					return 1;
-				}
+	        for (i = 0; i < ne; ++i) {
+	            if (wc[i].status != IBV_WC_SUCCESS) {
+	                fprintf(stderr, "Failed status %s (%d) for wr_id %d\n",
+	                        ibv_wc_status_str(wc[i].status),
+	                        wc[i].status, (int) wc[i].wr_id);
+	                return 1;
+	            }
 
-				switch ((int) wc[i].wr_id) {
-				case PINGPONG_SEND_WRID:
-					++scnt;
-					break;
+	            switch ((int) wc[i].wr_id) {
+	            case PINGPONG_SEND_WRID:
+	                ++cnt;
+	                if (cnt < iters - 1) {
+	                    if (pp_post_send(ctx, rem_dest->qpn, ctx->mtu)) {
+	                        fprintf(stderr, "Couldn't post send\n");
+	                        return 1;
+	                    }
+	                }
+	                else {
+	                    if (cnt == iters - 1) {
+	                        if (rmnder) {
+	                            if (pp_post_send(ctx, rem_dest->qpn, rmnder)) {
+	                                fprintf(stderr, "Couldn't post send\n");
+	                                return 1;
+	                            }
+	                        }
+	                        else {
+	                            if (pp_post_send(ctx, rem_dest->qpn, ctx->mtu)) {
+	                                fprintf(stderr, "Couldn't post send\n");
+	                                return 1;
+	                            }
+	                        }
+	                    }
+	                }
+	                break;
 
-				case PINGPONG_RECV_WRID:
-					if (--routs <= 1) {
-						routs += pp_post_recv(ctx, ctx->rx_depth - routs);
-						if (routs < ctx->rx_depth) {
-							fprintf(stderr,
-								"Couldn't post receive (%d)\n",
-								routs);
-							return 1;
-						}
-					}
+	            case PINGPONG_RECV_WRID:
+	                pp_dump_grh(ctx->grh_buf);
+	                if (cnt < iters)
+	                    pp_sdump_data(ctx->buf + cnt * ctx->mtu, ctx->mtu);
+	                else
+	                    pp_sdump_data(ctx->buf + cnt * ctx->mtu, rmnder);
+	                --routs;
+	                ++cnt;
+	                if (routs <= 1) {
+	                    unsigned int i = cnt + routs;
+	                    if (i < iters) {
+	                        while (routs < ctx->rx_depth) {
+	                            ++routs;
+	                            ++i;
+	                            if (i < iters) {
+	                                if (pp_post_recv(ctx, ctx->mtu)) {
+	                                    fprintf(stderr, "Couldn't post receive (%d)\n", routs);
+	                                    return 1;
+	                                }
+	                            }
+	                            else {
+	                                // i == iters
+	                                if (rmnder) {
+	                                    if (pp_post_recv(ctx, rmnder)) {
+	                                        fprintf(stderr, "Couldn't post receive (%d)\n", routs);
+	                                        return 1;
+	                                    }
+	                                }
+	                                else {
+	                                    if (pp_post_recv(ctx, ctx->mtu)) {
+	                                        fprintf(stderr, "Couldn't post receive (%d)\n", routs);
+	                                        return 1;
+	                                    }
+	                                }
+	                            }
+	                        }
+	                    }
+	                }
+	                break;
 
-					++rcnt;
-					break;
-
-				default:
-					fprintf(stderr, "Completion for unknown wr_id %d\n",
-						(int) wc[i].wr_id);
-					return 1;
-				}
-
-				ctx->pending &= ~(int) wc[i].wr_id;
-				if (scnt < iters && !ctx->pending) {
-				    usleep(100000);
-					if (pp_post_send(ctx, rem_dest->qpn)) {
-						fprintf(stderr, "Couldn't post send\n");
-						return 1;
-					}
-					ctx->pending = PINGPONG_RECV_WRID |
-						       PINGPONG_SEND_WRID;
-				}
-			}
-		}
+	            default:
+	                fprintf(stderr, "Completion for unknown wr_id %d\n",
+	                        (int) wc[i].wr_id);
+	                return 1;
+	            }
+	        }
+	    }
 	}
 
 	if (gettimeofday(&end, NULL)) {
@@ -846,7 +1047,7 @@ int main(int argc, char *argv[])
 	{
 		float usec = (end.tv_sec - start.tv_sec) * 1000000 +
 			(end.tv_usec - start.tv_usec);
-		long long bytes = (long long) size * iters * 2;
+		unsigned long long bytes = rmnder ? (cnt - 1) * ctx->mtu + rmnder : cnt * ctx->mtu;
 
 		printf("%lld bytes in %.2f seconds = %.2f Mbit/sec\n",
 		       bytes, usec / 1000000., bytes * 8. / usec);
