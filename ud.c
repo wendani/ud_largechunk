@@ -52,6 +52,8 @@
 
 #define GRH_SIZE    40
 
+//#define DEBUG_DUMP_RECV
+
 enum {
 	PINGPONG_RECV_WRID = 1,
 	PINGPONG_SEND_WRID = 2,
@@ -74,9 +76,12 @@ struct pingpong_context {
 	int			 rx_depth;
 	int			 pending;
 	struct ibv_port_attr     portinfo;
-	int          mtu;
-	struct ibv_mr       *mr_grh;
+	int             mtu;
+	struct ibv_mr   *mr_grh;
 	void            *buf_curr;
+	int             rx_refill_thrshld;
+	int             tx_depth;
+	int             tx_refill_thrshld;
 };
 
 struct pingpong_dest {
@@ -348,7 +353,7 @@ out:
 
 static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, unsigned long long size,
 					    int rx_depth, int port,
-					    int use_event)
+					    int use_event, int tx_depth)
 {
 	struct pingpong_context *ctx;
 
@@ -359,6 +364,9 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, unsigned 
 	ctx->size       = size;
 	ctx->send_flags = IBV_SEND_SIGNALED;
 	ctx->rx_depth   = rx_depth;
+	ctx->rx_refill_thrshld = 3 * rx_depth / 4;
+	ctx->tx_depth   = tx_depth;
+	ctx->tx_refill_thrshld = tx_depth >> 2;
 
 	ctx->grh_buf = memalign(page_size, GRH_SIZE);
     if (!ctx->grh_buf) {
@@ -397,6 +405,7 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, unsigned 
 //			fprintf(stderr, "Requested size larger than port MTU (%d)\n", mtu);
 //			goto clean_device;
 //		}
+		printf("Use mtu size %d\n", mtu);
 		ctx->mtu = mtu;
 	}
 
@@ -439,7 +448,7 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, unsigned 
 			.send_cq = ctx->cq,
 			.recv_cq = ctx->cq,
 			.cap     = {
-				.max_send_wr  = 1,
+				.max_send_wr  = tx_depth,
 				.max_recv_wr  = rx_depth,
 				.max_send_sge = 1,
 				.max_recv_sge = 2
@@ -665,6 +674,7 @@ static void usage(const char *argv0)
 	printf("  -n, --iters=<iters>    number of exchanges (default 1)\n");
 	printf("  -e, --events           sleep on CQ events (default poll)\n");
 	printf("  -g, --gid-idx=<gid index> local port gid index\n");
+	printf("  -t, --tx_depth=<dep>   number of sends to post at a time (default 50)\n");
 }
 
 int main(int argc, char *argv[])
@@ -691,6 +701,8 @@ int main(int argc, char *argv[])
 	char			 gid[33];
 	unsigned int            cnt;
 	int                     rmnder;
+	unsigned int            tx_depth = 50;
+	int                     touts;
 
 	srand48(getpid() * time(NULL));
 
@@ -707,10 +719,11 @@ int main(int argc, char *argv[])
 			{ .name = "sl",       .has_arg = 1, .val = 'l' },
 			{ .name = "events",   .has_arg = 0, .val = 'e' },
 			{ .name = "gid-idx",  .has_arg = 1, .val = 'g' },
+			{ .name = "tx-depth", .has_arg = 1, .val = 't' },
 			{ 0 }
 		};
 
-		c = getopt_long(argc, argv, "p:d:i:s:r:n:l:eg:",
+		c = getopt_long(argc, argv, "p:d:i:s:r:n:l:eg:t:",
 							long_options, NULL);
 		if (c == -1)
 			break;
@@ -760,6 +773,11 @@ int main(int argc, char *argv[])
 			gidx = strtol(optarg, NULL, 0);
 			break;
 
+		case 't':
+		    tx_depth = strtoul(optarg, NULL, 0);
+		    printf("tx_depth = %u\n", tx_depth);
+		    break;
+
 		default:
 			usage(argv[0]);
 			return 1;
@@ -799,7 +817,7 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	ctx = pp_init_ctx(ib_dev, size, rx_depth, ib_port, use_event);
+	ctx = pp_init_ctx(ib_dev, size, rx_depth, ib_port, use_event, tx_depth);
 	if (!ctx)
 		return 1;
 
@@ -889,33 +907,39 @@ int main(int argc, char *argv[])
 		pp_pop_data(ctx->buf, size, ctx->mtu);
 	}
 
+	if (gettimeofday(&start, NULL)) {
+		perror("gettimeofday");
+		return 1;
+	}
+
 	if (servername) {
-	    if (iters > 1) {
-	        if (pp_post_send(ctx, rem_dest->qpn, ctx->mtu)) {
-	            fprintf(stderr, "Couldn't post send\n");
-	            return 1;
-	        }
-	    }
-	    else {
-	        // iters == 1
-	        if (rmnder) {
-	            if (pp_post_send(ctx, rem_dest->qpn, rmnder)) {
-	                fprintf(stderr, "Couldn't post send\n");
-	                return 1;
-	            }
-	        }
-	        else {
+	    touts = 0;
+	    while (touts < ctx->tx_depth) {
+	        ++touts;
+
+	        if (touts < iters) {
 	            if (pp_post_send(ctx, rem_dest->qpn, ctx->mtu)) {
 	                fprintf(stderr, "Couldn't post send\n");
 	                return 1;
 	            }
 	        }
+	        else {
+	            // touts == iters
+	            if (rmnder) {
+	                if (pp_post_send(ctx, rem_dest->qpn, rmnder)) {
+	                    fprintf(stderr, "Couldn't post send\n");
+	                    return 1;
+	                }
+	            }
+	            else {
+	                if (pp_post_send(ctx, rem_dest->qpn, ctx->mtu)) {
+	                    fprintf(stderr, "Couldn't post send\n");
+	                    return 1;
+	                }
+	            }
+	            break;
+	        }
 	    }
-	}
-
-	if (gettimeofday(&start, NULL)) {
-		perror("gettimeofday");
-		return 1;
 	}
 
 	// completion events processing
@@ -965,25 +989,34 @@ int main(int argc, char *argv[])
 
 	            switch ((int) wc[i].wr_id) {
 	            case PINGPONG_SEND_WRID:
+	                --touts;
 	                ++cnt;
-	                if (cnt < iters - 1) {
-	                    if (pp_post_send(ctx, rem_dest->qpn, ctx->mtu)) {
-	                        fprintf(stderr, "Couldn't post send\n");
-	                        return 1;
-	                    }
-	                }
-	                else {
-	                    if (cnt == iters - 1) {
-	                        if (rmnder) {
-	                            if (pp_post_send(ctx, rem_dest->qpn, rmnder)) {
-	                                fprintf(stderr, "Couldn't post send\n");
-	                                return 1;
+	                if (touts <= ctx->tx_refill_thrshld) {
+	                    unsigned int i = cnt + touts;
+	                    if (i < iters) {
+	                        while (touts < ctx->tx_depth) {
+	                            ++touts;
+	                            ++i;
+	                            if (i < iters) {
+	                                if (pp_post_send(ctx, rem_dest->qpn, ctx->mtu)) {
+	                                    fprintf(stderr, "Couldn't post send\n");
+	                                    return 1;
+	                                }
 	                            }
-	                        }
-	                        else {
-	                            if (pp_post_send(ctx, rem_dest->qpn, ctx->mtu)) {
-	                                fprintf(stderr, "Couldn't post send\n");
-	                                return 1;
+	                            else {
+	                                // i == iters
+	                                if (rmnder) {
+	                                    if (pp_post_send(ctx, rem_dest->qpn, rmnder)) {
+	                                        fprintf(stderr, "Couldn't post send\n");
+	                                        return 1;
+	                                    }
+	                                }
+	                                else {
+	                                    if (pp_post_send(ctx, rem_dest->qpn, ctx->mtu)) {
+	                                        fprintf(stderr, "Couldn't post send\n");
+	                                        return 1;
+	                                    }
+	                                }
 	                            }
 	                        }
 	                    }
@@ -991,14 +1024,16 @@ int main(int argc, char *argv[])
 	                break;
 
 	            case PINGPONG_RECV_WRID:
+#ifdef DEBUG_DUMP_RECV
 	                pp_dump_grh(ctx->grh_buf);
 	                if (cnt < iters)
 	                    pp_sdump_data(ctx->buf + cnt * ctx->mtu, ctx->mtu);
 	                else
 	                    pp_sdump_data(ctx->buf + cnt * ctx->mtu, rmnder);
+#endif
 	                --routs;
 	                ++cnt;
-	                if (routs <= 1) {
+	                if (routs <= ctx->rx_refill_thrshld) {
 	                    unsigned int i = cnt + routs;
 	                    if (i < iters) {
 	                        while (routs < ctx->rx_depth) {
