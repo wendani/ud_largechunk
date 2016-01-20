@@ -1,7 +1,7 @@
 top_builddir := ..
 lib_LTLIBRARIES = src/libibverbs.la
 
-AM_CFLAGS := -Wall -O2
+AM_CFLAGS := -g -Wall -pg
 CC      := gcc
 CFLAGS  := $(AM_CFLAGS) -I../include -D_GNU_SOURCE -D_REENTRANT
 LD      := gcc
@@ -13,7 +13,7 @@ LDFLAGS := $(LDFLAGS) $(LIBS)
 
 SHELL 	:= /bin/bash
 LIBTOOL := $(SHELL) $(top_builddir)/libtool
-APPS    := ud devinfo ud_pingpong
+APPS    := ud devinfo ud_pingpong rc
 
 
 all: $(APPS)
@@ -28,13 +28,22 @@ pingpong.o: pingpong.c pingpong.h
 	$(CC) $(CFLAGS) -c $<
 
 
+rc: rc.o pingpong.o
+	$(LIBTOOL) --tag=CC --mode=link $(LD) $(AM_CFLAGS) -o $@ $^ $(LDFLAGS)
+
+rc.o: rc.c pingpong.h
+	$(CC) $(CFLAGS) -c $<
+
 
 devinfo: devinfo.o pingpong.o
 	$(LIBTOOL) --tag=CC --mode=link $(LD) $(AM_CFLAGS) -o $@ $^ $(LDFLAGS)
+
+devinfo.o: devinfo.c pingpong.h
+	$(CC) $(CFLAGS) -c $<
 
 ud_pingpong: ud_pingpong.o pingpong.o
 	$(LIBTOOL) --tag=CC --mode=link $(LD) $(AM_CFLAGS) -o $@ $^ $(LDFLAGS)
 #	$(LD) -o $@ $^ $(LDFLAGS)
 
 clean:
-	rm -rf $(APPS) ud.o
+	rm -rf $(APPS) ud.o pingpong.o devinfo.o *.out
