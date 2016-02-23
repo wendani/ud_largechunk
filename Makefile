@@ -38,4 +38,4 @@ ud_pingpong: ud_pingpong.o pingpong.o
 #	$(LD) -o $@ $^ $(LDFLAGS)
 
 clean:
-	rm -rf $(APPS) ud.o pingpong.o devinfo.o *.out
+	rm -rf $(APPS) *.o *.out
