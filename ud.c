@@ -666,15 +666,16 @@ static void usage(const char *argv0)
 	printf("  %s <host>     connect to server at <host>\n", argv0);
 	printf("\n");
 	printf("Options:\n");
-	printf("  -p, --port=<port>      listen on/connect to port <port> (default 18515)\n");
-	printf("  -d, --ib-dev=<dev>     use IB device <dev> (default first device found)\n");
-	printf("  -i, --ib-port=<port>   use port <port> of IB device (default 1)\n");
-	printf("  -s, --size=<size>      size of message to exchange (default 2048)\n");
-	printf("  -r, --rx-depth=<dep>   number of receives to post at a time (default 500)\n");
-	printf("  -n, --iters=<iters>    number of exchanges (default 1)\n");
-	printf("  -e, --events           sleep on CQ events (default poll)\n");
+	printf("  -p, --port=<port>         listen on/connect to port <port> (default 18515)\n");
+	printf("  -d, --ib-dev=<dev>        use IB device <dev> (default first device found)\n");
+	printf("  -i, --ib-port=<port>      use port <port> of IB device (default 1)\n");
+	printf("  -s, --size=<size>         size of message to exchange (default 2048)\n");
+	printf("  -r, --rx-depth=<dep>      number of receives to post at a time (default 500)\n");
+	printf("  -n, --iters=<iters>       number of exchanges (default 1)\n");
+	printf("  -l, --sl=<sl>             service level value\n");
+	printf("  -e, --events              sleep on CQ events (default poll)\n");
 	printf("  -g, --gid-idx=<gid index> local port gid index\n");
-	printf("  -t, --tx_depth=<dep>   number of sends to post at a time (default 50)\n");
+	printf("  -t, --tx_depth=<dep>      number of sends to post at a time (default 50)\n");
 }
 
 int main(int argc, char *argv[])
