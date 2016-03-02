@@ -53,6 +53,8 @@
 #define GRH_SIZE    40
 
 //#define DEBUG_DUMP_RECV
+//#define DEBUG_DATA_POP_VARIATION
+//#define DEBUG_SEND_DATA_CHANGE
 
 enum {
 	PINGPONG_RECV_WRID = 1,
@@ -112,7 +114,12 @@ static inline void pp_sdump_data(void *buf, int size)
 
 static void pp_pop_data(void *buf, unsigned long long size, int mtu)
 {
+
     int val = 65;
+#ifdef DEBUG_DATA_POP_VARIATION
+    val = val + rand() % 26;
+    printf("pp_pop_data(): val = %d\n", val);
+#endif
 
     if (size > mtu) {
         int i = 0;
@@ -701,9 +708,15 @@ int main(int argc, char *argv[])
 	int			 gidx = -1;
 	char			 gid[33];
 	unsigned int            cnt;
+	unsigned int            iter_cnt;
 	int                     rmnder;
 	unsigned int            tx_depth = 50;
 	int                     touts;
+	int                     touts_in_msg;
+	int                     touts_in_mtu;
+	unsigned int            size_in_mtu;
+	int                     routs_in_msg;
+	int                     routs_in_mtu;
 
 	srand48(getpid() * time(NULL));
 
@@ -823,23 +836,26 @@ int main(int argc, char *argv[])
 		return 1;
 
 
-	iters = size / ctx->mtu;
+	size_in_mtu = size / ctx->mtu;
 	if ((rmnder = size % ctx->mtu))
-	    ++iters;
+	    ++size_in_mtu;
 
 	if (!servername) {
 	    routs = 0;
+	    routs_in_msg = 0;
+	    routs_in_mtu = 0;
 	    while (routs < ctx->rx_depth) {
 	        ++routs;
+	        ++routs_in_mtu;
 
-	        if (routs < iters) {
+	        if (routs_in_mtu < size_in_mtu) {
 	            if (pp_post_recv(ctx, ctx->mtu)) {
 	                fprintf(stderr, "Couldn't post receive (%d)\n", routs);
 	                return 1;
 	            }
 	        }
 	        else {
-	            // routs == iters
+	            // routs_in_mtu == size_in_mtu
 	            if (rmnder) {
 	                if (pp_post_recv(ctx, rmnder)) {
 	                    fprintf(stderr, "Couldn't post receive (%d)\n", routs);
@@ -852,7 +868,10 @@ int main(int argc, char *argv[])
 	                    return 1;
 	                }
 	            }
-	            break;
+	            ++routs_in_msg;
+	            routs_in_mtu = 0;
+	            ctx->buf_curr = ctx->buf;
+	            if (routs_in_msg == iters) break;
 	        }
 	    }
 	}
@@ -915,17 +934,20 @@ int main(int argc, char *argv[])
 
 	if (servername) {
 	    touts = 0;
+	    touts_in_msg = 0;
+	    touts_in_mtu = 0;
 	    while (touts < ctx->tx_depth) {
 	        ++touts;
+	        ++touts_in_mtu;
 
-	        if (touts < iters) {
+	        if (touts_in_mtu < size_in_mtu) {
 	            if (pp_post_send(ctx, rem_dest->qpn, ctx->mtu)) {
 	                fprintf(stderr, "Couldn't post send\n");
 	                return 1;
 	            }
 	        }
 	        else {
-	            // touts == iters
+	            // touts_in_mtu == size_in_mtu
 	            if (rmnder) {
 	                if (pp_post_send(ctx, rem_dest->qpn, rmnder)) {
 	                    fprintf(stderr, "Couldn't post send\n");
@@ -938,14 +960,18 @@ int main(int argc, char *argv[])
 	                    return 1;
 	                }
 	            }
-	            break;
+	            ++touts_in_msg;
+	            touts_in_mtu = 0;
+	            ctx->buf_curr = ctx->buf;
+	            if (touts_in_msg == iters) break;
 	        }
 	    }
 	}
 
 	// completion events processing
 	cnt = 0;
-	while (cnt < iters) {
+	iter_cnt = 0;
+	while (iter_cnt < iters) {
 	    if (use_event) {
 	        struct ibv_cq *ev_cq;
 	        void          *ev_ctx;
@@ -992,20 +1018,34 @@ int main(int argc, char *argv[])
 	            case PINGPONG_SEND_WRID:
 	                --touts;
 	                ++cnt;
+	                if (!touts_in_msg) {
+	                    --touts_in_mtu;
+	                }
+	                else {
+	                    // touts_in_msg != 0
+	                    if (cnt == size_in_mtu) {
+	                        --touts_in_msg;
+	                        ++iter_cnt;
+	                        cnt = 0;
+	                    }
+	                }
 	                if (touts <= ctx->tx_refill_thrshld) {
-	                    unsigned int i = cnt + touts;
-	                    if (i < iters) {
+	                    unsigned int i = touts_in_msg ? touts_in_mtu : cnt + touts_in_mtu;
+	                    // the second condition is placed in the case of shallow tx_depth that cannot hold a message
+	                    // In such a case, the first condition is always true even when enough sends have been posted
+	                    if ((touts_in_msg + iter_cnt < iters) && (i < size_in_mtu)) {
 	                        while (touts < ctx->tx_depth) {
 	                            ++touts;
+	                            ++touts_in_mtu;
 	                            ++i;
-	                            if (i < iters) {
+	                            if (i < size_in_mtu) {
 	                                if (pp_post_send(ctx, rem_dest->qpn, ctx->mtu)) {
 	                                    fprintf(stderr, "Couldn't post send\n");
 	                                    return 1;
 	                                }
 	                            }
 	                            else {
-	                                // i == iters
+	                                // i == size_in_mtu
 	                                if (rmnder) {
 	                                    if (pp_post_send(ctx, rem_dest->qpn, rmnder)) {
 	                                        fprintf(stderr, "Couldn't post send\n");
@@ -1018,6 +1058,13 @@ int main(int argc, char *argv[])
 	                                        return 1;
 	                                    }
 	                                }
+	                                ++touts_in_msg;
+	                                touts_in_mtu = 0;
+	                                i = 0;
+	                                ctx->buf_curr = ctx->buf;
+#ifdef DEBUG_SEND_DATA_CHANGE
+	                                pp_pop_data(ctx->buf, size, ctx->mtu);
+#endif
 	                            }
 	                        }
 	                    }
@@ -1027,27 +1074,41 @@ int main(int argc, char *argv[])
 	            case PINGPONG_RECV_WRID:
 #ifdef DEBUG_DUMP_RECV
 	                pp_dump_grh(ctx->grh_buf);
-	                if (cnt < iters)
+	                if (cnt < size_in_mtu)
 	                    pp_sdump_data(ctx->buf + cnt * ctx->mtu, ctx->mtu);
 	                else
 	                    pp_sdump_data(ctx->buf + cnt * ctx->mtu, rmnder);
 #endif
 	                --routs;
 	                ++cnt;
+	                if (!routs_in_msg) {
+	                    --routs_in_mtu;
+	                }
+	                else {
+	                    // routs_in_msg != 0
+	                    if (cnt == size_in_mtu) {
+	                        --routs_in_msg;
+	                        ++iter_cnt;
+	                        cnt = 0;
+	                    }
+	                }
 	                if (routs <= ctx->rx_refill_thrshld) {
-	                    unsigned int i = cnt + routs;
-	                    if (i < iters) {
+	                    unsigned int i = routs_in_msg ? routs_in_mtu : cnt + routs_in_mtu;
+	                    // the second condition is placed in the case of shallow rx_depth that cannot hold a message
+	                    // In such a case, the first condition is always true even when enough receives have been posted
+	                    if ((routs_in_msg + iter_cnt < iters) && (i < size_in_mtu)) {
 	                        while (routs < ctx->rx_depth) {
 	                            ++routs;
+	                            ++routs_in_mtu;
 	                            ++i;
-	                            if (i < iters) {
+	                            if (i < size_in_mtu) {
 	                                if (pp_post_recv(ctx, ctx->mtu)) {
 	                                    fprintf(stderr, "Couldn't post receive (%d)\n", routs);
 	                                    return 1;
 	                                }
 	                            }
 	                            else {
-	                                // i == iters
+	                                // i == size_in_mtu
 	                                if (rmnder) {
 	                                    if (pp_post_recv(ctx, rmnder)) {
 	                                        fprintf(stderr, "Couldn't post receive (%d)\n", routs);
@@ -1060,6 +1121,10 @@ int main(int argc, char *argv[])
 	                                        return 1;
 	                                    }
 	                                }
+	                                ++routs_in_msg;
+	                                routs_in_mtu = 0;
+	                                i = 0;
+	                                ctx->buf_curr = ctx->buf;
 	                            }
 	                        }
 	                    }
@@ -1083,7 +1148,9 @@ int main(int argc, char *argv[])
 	{
 		float usec = (end.tv_sec - start.tv_sec) * 1000000 +
 			(end.tv_usec - start.tv_usec);
-		unsigned long long bytes = rmnder ? (cnt - 1) * ctx->mtu + rmnder : cnt * ctx->mtu;
+//		printf("size_in_mtu = %u, mtu = %d, iter_cnt = %u\n ", size_in_mtu, ctx->mtu, iter_cnt);
+		unsigned long long bytes = rmnder ? ((unsigned long long)(size_in_mtu - 1) * ctx->mtu + rmnder) * iter_cnt
+		        : ((unsigned long long)size_in_mtu * ctx->mtu) * iter_cnt;
 
 		printf("%lld bytes in %.2f seconds = %.2f Mbit/sec\n",
 		       bytes, usec / 1000000., bytes * 8. / usec);
